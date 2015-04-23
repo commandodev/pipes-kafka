@@ -3,23 +3,25 @@
 {-# LANGUAGE ViewPatterns        #-}
 module Pipes.Kafka where
 
+
 import           Control.Lens
-import Control.Monad (forever)
+import           Control.Monad                  (forever, void)
 import           Control.Monad.IO.Class         (liftIO)
 import qualified Data.ByteString                as BS
+import qualified Data.ByteString.Char8          as C8
 import           Haskakafka                     (KafkaProducePartition (..),
                                                  KafkaTopic)
 import qualified Haskakafka                     as HK
 import qualified Haskakafka.InternalRdKafkaEnum as HK
 import qualified Haskakafka.InternalSetup       as HK
-import           Pipes                          (Consumer, Producer, runEffect)
+import           Pipes                          (Consumer, Producer, runEffect,
+                                                 (>->))
 import qualified Pipes                          as P
 import qualified Pipes.Prelude                  as P
 import           Pipes.Safe                     (MonadCatch, MonadSafe, SafeT)
 import qualified Pipes.Safe                     as PS
 
 type Topic = String
-type Offset = Int
 
 data ConnectOpts = ConnectOpts {
     _hostString     :: String
@@ -34,7 +36,7 @@ kafkaSink
   :: (MonadSafe m)
   => ConnectOpts
   -> KafkaProducePartition
-  -> Consumer BS.ByteString (SafeT m) (Maybe HK.KafkaError)
+  -> Consumer BS.ByteString  m (Maybe HK.KafkaError)
 kafkaSink co partition = PS.bracket connect release publish
   where
     connect = liftIO $ do
@@ -45,28 +47,7 @@ kafkaSink co partition = PS.bracket connect release publish
     release (fst -> k) = liftIO $ HK.drainOutQueue k
     publish (snd -> t) = forever $ do
       m <- P.await
-      P.liftIO $ HK.produceMessage t partition $ HK.KafkaProduceMessage m
-{-
-
-withKafkaConsumerSource
-
-:: ConfigOverrides
-config overrides for kafka. See https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md. Use an empty list if you don't care.
--> ConfigOverrides
-config overrides for topic. See https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md. Use an empty list if you don't care.
--> String
-broker string, e.g. localhost:9092
--> String
-topic name
--> Int
-partition to consume from. Locked until the function returns.
--> KafkaOffset
-where to begin consuming in the partition.
--> (Kafka -> KafkaTopic -> IO a)
-your cod, fed with Kafka and KafkaTopic instances for subsequent interaction.
--> IO a
--}
-
+      liftIO $ HK.produceMessage t partition $ HK.KafkaProduceMessage m
 {-
   bracket
     (do
@@ -80,14 +61,12 @@ your cod, fed with Kafka and KafkaTopic instances for subsequent interaction.
     (\(k, t) -> cb k t)
 -}
 
-
-
 kafkaSource
-  :: (MonadSafe m)
+  :: forall m. (MonadSafe m)
   => ConnectOpts
   -> Int
-  -> Offset
-  -> Producer HK.KafkaMessage (SafeT m) ()
+  -> HK.KafkaOffset
+  -> Producer HK.KafkaMessage m ()
 kafkaSource co partition offset = PS.bracket connect release consume
   where
     connect = liftIO $ do
@@ -96,8 +75,17 @@ kafkaSource co partition offset = PS.bracket connect release consume
       topic <- HK.newKafkaTopic kafka (co ^. topicName) (co ^. topicOverrides)
       HK.startConsuming topic partition offset
       return (kafka, topic)
-    release (kafka, topic) = liftIO $ HK.stopConsuming topic kafka
+    release (snd -> topic) = liftIO $ HK.stopConsuming topic partition
+    consume :: (HK.Kafka, HK.KafkaTopic) -> Producer HK.KafkaMessage m ()
     consume (snd -> t) = forever $ do
-      m <- P.liftIO $ HK.consumeMessage _ --t partition $ HK.KafkaProduceMessage m
-      P.yield m
+      ret <- liftIO $ HK.consumeMessage t partition (-1)
+      case ret of
+        Left err -> return ()
+        Right m -> P.yield m
 
+main :: IO ()
+main = do
+  PS.runSafeT $ runEffect $ P.each [(1::Int)..5] >-> P.map (C8.pack . show) >-> (void sink)
+  where
+    opts = ConnectOpts "localhost:9092" "test" [] []
+    sink = kafkaSink opts HK.KafkaUnassignedPartition
