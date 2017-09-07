@@ -18,3 +18,4 @@ TAGS
 *.tix
 *~
 nixpkgs
+.stack-work/
