@@ -1,0 +1,7 @@
+flags: {}
+extra-package-dbs: []
+packages:
+- '.'
+extra-deps:
+  - hw-kafka-client-2.0.0
+resolver: lts-9.3

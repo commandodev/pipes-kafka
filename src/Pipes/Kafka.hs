@@ -1,104 +1,83 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell     #-}
-{-# LANGUAGE ViewPatterns        #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell   #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
 module Pipes.Kafka where
 
+import           Control.Concurrent        (threadDelay)
+import           Control.Monad             (forever)
+import           Control.Monad.Catch       (throwM)
+import           Control.Monad.IO.Class    (MonadIO, liftIO)
+import           Control.Monad.Logger      (MonadLogger, logDebug, logWarn)
+import           Control.Monad.Trans.Class (lift)
+import qualified Data.ByteString           as BS
 
-import           Control.Lens
-import           Control.Monad                  (forever, void)
-import           Control.Monad.IO.Class         (liftIO)
-import qualified Data.ByteString                as BS
-import qualified Data.ByteString.Char8          as C8
-import           Haskakafka                     (Kafka, KafkaError (..),
-                                                 KafkaMessage (..),
-                                                 KafkaOffset (..),
-                                                 KafkaProduceMessage (..),
-                                                 KafkaProducePartition (..),
-                                                 KafkaTopic)
-import qualified Haskakafka                     as HK
-import qualified Haskakafka.InternalRdKafkaEnum as HK
-import qualified Haskakafka.InternalSetup       as HK
-import           Pipes                          (Consumer, Producer, runEffect,
-                                                 (>->))
-import qualified Pipes                          as P
-import qualified Pipes.Prelude                  as P
-import           Pipes.Safe                     (MonadCatch, MonadSafe, SafeT)
-import qualified Pipes.Safe                     as PS
+import           Data.Text                 (pack)
+import           Kafka.Consumer            (ConsumerProperties, ConsumerRecord,
+                                            Subscription, Timeout (..),
+                                            TopicName (..), closeConsumer,
+                                            newConsumer, pollMessage)
+import           Kafka.Producer            (ProducePartition (..),
+                                            ProducerProperties,
+                                            ProducerRecord (..),
+                                            RdKafkaRespErrT (..), closeProducer,
+                                            newProducer, produceMessage)
+import           Kafka.Types               (KafkaError (..))
+import           Pipes                     (Consumer, Producer)
+import qualified Pipes                     as P
 
---------------------------------------------------------------------------------
-type Topic = String
+import           Pipes.Safe                (MonadSafe)
+import qualified Pipes.Safe                as PS
 
-data ConnectOpts = ConnectOpts {
-    _hostString     :: String
-  , _topicName      :: String
-  , _topicOverrides :: HK.ConfigOverrides
-  , _kafkaOverrides :: HK.ConfigOverrides
-  } deriving Show
-
-makeLenses ''ConnectOpts
-
-data MessageTimeout =
-    After !Int
-  | Never
-  deriving (Show)
-
-timeoutToInt :: MessageTimeout -> Int
-timeoutToInt (Never) = (-1)
-timeoutToInt (After i) = i
-
-
---------------------------------------------------------------------------------
-kafkaSink
-  :: (MonadSafe m)
-  => ConnectOpts
-  -> KafkaProducePartition
-  -> Consumer BS.ByteString  m (Maybe KafkaError)
-kafkaSink co partition = PS.bracket connect release publish
+kafkaSink ::
+     (MonadIO m, MonadSafe m)
+  => ProducerProperties
+  -> TopicName
+  -> Consumer BS.ByteString m ()
+kafkaSink props topic = PS.bracket connect release publish
   where
-    connect = liftIO $ do
-      kafka <- HK.newKafka HK.RdKafkaProducer (co ^. kafkaOverrides)
-      HK.addBrokers kafka (co ^. hostString)
-      topic <- HK.newKafkaTopic kafka (co ^. topicName) (co ^. topicOverrides)
-      return (kafka, topic)
-    release (fst -> k) = liftIO $ HK.drainOutQueue k
-    publish (snd -> t) = forever $ do
-      m <- P.await
-      liftIO $ HK.produceMessage t partition $ KafkaProduceMessage m
+    connect = do
+      res <- liftIO $ newProducer props
+      case res of
+        Left err       -> liftIO $ throwM err
+        Right producer -> pure producer
+    release producer = liftIO $ closeProducer producer
+    publish producer =
+      forever $ do
+        m <- P.await
+        liftIO $ produceMessage producer $ mkMessage topic Nothing (Just m)
+    mkMessage t k v =
+      ProducerRecord
+      {prTopic = t, prPartition = UnassignedPartition, prKey = k, prValue = v}
 
---------------------------------------------------------------------------------
-kafkaSource
-  :: forall m. (MonadSafe m)
-  => ConnectOpts
-  -> Int
-  -> KafkaOffset
-  -> MessageTimeout
-  -> Producer KafkaMessage m ()
-kafkaSource co partition offset to = PS.bracket connect release consume
+kafkaSource ::
+     (MonadIO m, MonadSafe m, MonadLogger m)
+  => ConsumerProperties
+  -> Subscription
+  -> Timeout
+  -> Producer (ConsumerRecord (Maybe BS.ByteString) (Maybe BS.ByteString)) m ()
+kafkaSource props subs timeout@(Timeout timeoutms) =
+  PS.bracket connect release consume
   where
-    connect = liftIO $ do
-      kafka <- HK.newKafka HK.RdKafkaConsumer (co ^. kafkaOverrides)
-      HK.addBrokers kafka (co ^. hostString)
-      topic <- HK.newKafkaTopic kafka (co ^. topicName) (co ^. topicOverrides)
-      HK.startConsuming topic partition offset
-      return (kafka, topic)
-    release (_kafka, topic) = liftIO $ HK.stopConsuming topic partition
-    consume :: (Kafka, KafkaTopic) -> Producer KafkaMessage m ()
-    consume (k, t) = do
-      ret <- liftIO $ HK.consumeMessage t partition (timeoutToInt to)
-      case ret of
-        Left _err -> return ()
-        Right m -> do
-          P.yield m
-          consume (k ,t)
+    connect = do
+      res <- liftIO $ newConsumer props subs
+      case res of
+        Left err       -> liftIO $ throwM err
+        Right consumer -> pure consumer
+    release consumer = liftIO $ closeConsumer consumer
+    consume consumer =
+      forever $ do
+        res <- liftIO $ pollMessage consumer timeout
+        case res of
+          Left (KafkaResponseError RdKafkaRespErrPartitionEof) ->
+            waitForMessages timeoutms
+          Left (KafkaResponseError RdKafkaRespErrTimedOut) -> waitForMessages 0
+          Left err -> do
+            lift . $(logWarn) . pack . show $ err
+            waitForMessages timeoutms
+          Right m -> P.yield m
+    waitForMessages t = do
+      lift $ $(logDebug) "waiting for new messages"
+      liftIO . threadDelay $ 1000 * t
 
---------------------------------------------------------------------------------
-main :: IO ()
-main = do
-  PS.runSafeT $ runEffect nums
-  PS.runSafeT $ runEffect $ P.for source $ \msg ->
-    liftIO $ print msg
-  where
-    opts = ConnectOpts "localhost:9092" "testing" [] []
-    sink = kafkaSink opts HK.KafkaUnassignedPartition
-    nums = P.each [(1::Int)..5] >-> P.map (C8.pack . show) >-> (void sink)
-    source = kafkaSource opts 0 HK.KafkaOffsetBeginning Never
+instance MonadLogger m => MonadLogger (PS.SafeT m)
